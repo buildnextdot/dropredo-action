@@ -131,7 +131,7 @@ esac
 [[ "$poll_interval" =~ ^[1-9][0-9]*$ ]] || fail "poll-interval-seconds must be a whole number above 0."
 
 # Commas, spaces or new lines between IDs; none runs every environment.
-environments=$(echo "${DROPREDO_ENVIRONMENTS:-}" | tr ', ' '\n\n' | jq -R 'select(length > 0)' | jq -s -c '.')
+environments=$(echo "${DROPREDO_ENVIRONMENTS:-}" | tr ',' ' ' | tr -s '[:space:]' '\n' | jq -R 'select(length > 0)' | jq -s -c '.')
 
 run_body=$(jq -n -c \
   --arg browser "$browser" \
