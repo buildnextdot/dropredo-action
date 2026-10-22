@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Checks this workflow, including the inputs it passes to the action
+      # against action.yml.
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+
+      - name: shellcheck
+        run: shellcheck scripts/run.sh
+
+  test:
+    name: Test against a mock API
+    runs-on: ubuntu-latest
+    env:
+      MOCK_URL: http://127.0.0.1:8080
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the mock DropRedo and GitHub APIs
+        run: |
+          python3 tests/mock_server.py 8080 &
+          for _ in $(seq 20); do curl -sf "$MOCK_URL/_state" > /dev/null && exit 0; sleep 0.5; done
+          echo "::error::The mock server did not start."
+          exit 1
+
+      - name: A passing run, commented on pull request 7
+        id: pass
+        uses: ./
+        with:
+          api-token: test-token
+          trigger-id: trigger-pass
+          browser: firefox
+          environments: |
+            env-a
+            env-b
+          poll-interval-seconds: 1
+          api-url: ${{ env.MOCK_URL }}
+          github-api-url: ${{ env.MOCK_URL }}/github
+          github-token: github-test-token
+          pull-request-number: 7
+
+      - name: The same run again, which updates its comment
+        id: pass-again
+        uses: ./
+        with:
+          api-token: test-token
+          trigger-id: trigger-pass
+          browser: firefox
+          environments: env-a, env-b
+          poll-interval-seconds: 1
+          api-url: ${{ env.MOCK_URL }}
+          github-api-url: ${{ env.MOCK_URL }}/github
+          github-token: github-test-token
+          pull-request-number: 7
+
+      - name: A failing run
+        id: fail
+        continue-on-error: true
+        uses: ./
+        with:
+          api-token: test-token
+          trigger-id: trigger-fail
+          poll-interval-seconds: 1
+          api-url: ${{ env.MOCK_URL }}
+          github-api-url: ${{ env.MOCK_URL }}/github
+          github-token: github-test-token
+          pull-request-number: 7
+
+      - name: A run paused for manual action
+        id: manual
+        continue-on-error: true
+        uses: ./
+        with:
+          api-token: test-token
+          trigger-id: trigger-manual
+          poll-interval-seconds: 1
+          api-url: ${{ env.MOCK_URL }}
+          comment-on-pr: false
+
+      - name: A failing run, only started
+        id: no-wait
+        uses: ./
+        with:
+          api-token: test-token
+          trigger-id: trigger-fail
+          wait: false
+          public-report: false
+          api-url: ${{ env.MOCK_URL }}
+
+      - name: A wrong token
+        id: bad-token
+        continue-on-error: true
+        uses: ./
+        with:
+          api-token: wrong-token
+          trigger-id: trigger-pass
+          api-url: ${{ env.MOCK_URL }}
+
+      - name: Check the results
+        env:
+          PASS_OUTCOME: ${{ steps.pass.outcome }}
+          PASS_PASSED: ${{ steps.pass.outputs.passed }}
+          PASS_STATUS: ${{ steps.pass.outputs.status }}
+          PASS_REPORT: ${{ steps.pass.outputs.report-url }}
+          PASS_AGAIN_OUTCOME: ${{ steps.pass-again.outcome }}
+          FAIL_OUTCOME: ${{ steps.fail.outcome }}
+          FAIL_PASSED: ${{ steps.fail.outputs.passed }}
+          FAIL_STATUS: ${{ steps.fail.outputs.status }}
+          MANUAL_OUTCOME: ${{ steps.manual.outcome }}
+          MANUAL_STATUS: ${{ steps.manual.outputs.status }}
+          NO_WAIT_OUTCOME: ${{ steps.no-wait.outcome }}
+          NO_WAIT_PASSED: ${{ steps.no-wait.outputs.passed }}
+          NO_WAIT_EXECUTION: ${{ steps.no-wait.outputs.execution-id }}
+          BAD_TOKEN_OUTCOME: ${{ steps.bad-token.outcome }}
+        run: |
+          errors=0
+          check() {
+            if [ "$2" = "$3" ]; then echo "ok: $1"; else echo "::error::$1: expected '$3', got '$2'"; errors=$((errors + 1)); fi
+          }
+
+          state=$(curl -sf "$MOCK_URL/_state")
+          echo "$state" | jq .
+
+          check "passing run succeeds" "$PASS_OUTCOME" success
+          check "passing run's passed output" "$PASS_PASSED" true
+          check "passing run's status output" "$PASS_STATUS" completed
+          check "passing run's report link" "$PASS_REPORT" "$MOCK_URL/r/exec-trigger-pass"
+          check "second passing run succeeds" "$PASS_AGAIN_OUTCOME" success
+          check "failing run fails the step" "$FAIL_OUTCOME" failure
+          check "failing run's passed output" "$FAIL_PASSED" false
+          check "failing run's status output" "$FAIL_STATUS" failed
+          check "manual run fails the step" "$MANUAL_OUTCOME" failure
+          check "manual run's status output" "$MANUAL_STATUS" "waiting for manual action"
+          check "started-only run succeeds" "$NO_WAIT_OUTCOME" success
+          check "started-only run has no passed output" "$NO_WAIT_PASSED" ""
+          check "started-only run's execution ID" "$NO_WAIT_EXECUTION" exec-trigger-fail
+          check "wrong token fails the step" "$BAD_TOKEN_OUTCOME" failure
+
+          check "run body with environments" "$(echo "$state" | jq -c '.runs[0].body')" '{"browser":"firefox","public_report":true,"environments":["env-a","env-b"]}'
+          check "comma-separated environments" "$(echo "$state" | jq -c '.runs[1].body.environments')" '["env-a","env-b"]'
+          check "run body without environments" "$(echo "$state" | jq -c '.runs[2].body')" '{"browser":"chromium","public_report":true}'
+          check "public report turned off" "$(echo "$state" | jq -c '.runs[4].body.public_report')" false
+          check "one comment per trigger and browser" "$(echo "$state" | jq '.comments | length')" 2
+          check "passing comment links the report" "$(echo "$state" | jq -r '.comments[0].body | contains("[View the run report](" + env.MOCK_URL + "/r/exec-trigger-pass)")')" true
+          check "failing comment says failed" "$(echo "$state" | jq -r '.comments[1].body | contains("DropRedo (chromium): failed")')" true
+
+          exit "$errors"
